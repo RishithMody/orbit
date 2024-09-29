@@ -65,6 +65,12 @@ def process_flight_data(data):
             # Get the marketing airline name (assuming there's at least one)
             airline_name = leg['carriers']['marketing'][0]['name'] if leg['carriers']['marketing'] else "Unknown Airline"
             
+            # Get flightNumber and alternateId from the first segment
+            # (assuming there's at least one segment and we're interested in the first one)
+            first_segment = leg['segments'][0] if leg['segments'] else {}
+            flight_number = first_segment.get('flightNumber', 'N/A')
+            alternate_id = first_segment.get('marketingCarrier', {}).get('alternateId', 'N/A')
+            
             flight = {
                 'price': itinerary['price']['formatted'],
                 'from': f"{leg['origin']['city']} ({leg['origin']['displayCode']})",
@@ -72,7 +78,9 @@ def process_flight_data(data):
                 'departure': datetime.fromisoformat(leg['departure']).strftime('%Y-%m-%d %H:%M'),
                 'arrival': datetime.fromisoformat(leg['arrival']).strftime('%Y-%m-%d %H:%M'),
                 'duration': f"{leg['durationInMinutes'] // 60}h {leg['durationInMinutes'] % 60}m",
-                'airline': airline_name
+                'airline': airline_name,
+                'flightNumber': flight_number,
+                'alternateId': alternate_id
             }
             processed_flights.append(flight)
     
@@ -83,36 +91,40 @@ def extract_flight_details(flights_data):
     most_economical = None
     shortest = None
 
-    highest_score = -1
-    cheapest_price = float('inf')
-    shortest_duration = float('inf')
-
     for flight in flights_data.get('itineraries', []):
-        score = flight.get('score', 0)
-        price_raw = flight.get('price', {}).get('raw', float('inf'))
-        legs = flight.get('legs', [])
+        tags = flight.get('tags', [])
         
-        # Calculate total duration for shortest flight
-        total_duration = sum(leg.get('durationInMinutes', 0) for leg in legs)
+        # Check for the "cheapest" tag
+        if 'cheapest' in tags:
+            most_economical = flight
 
-        # Determine best overall based on score
-        if score > highest_score:
-            highest_score = score
+        # Check for the "shortest" tag
+        if 'shortest' in tags:
+            shortest = flight
+
+        # Assuming best overall is determined by the highest score
+        if best_overall is None or flight.get('score', 0) > best_overall.get('score', 0):
             best_overall = flight
 
-        # Determine most economical based on price tag
-        if 'cheapest' in flight.get('tags', []):
-            if price_raw < cheapest_price:
-                cheapest_price = price_raw
-                most_economical = flight
-
-        # Determine shortest based on duration tag and duration
-        if 'shortest' in flight.get('tags', []):
-            if total_duration < shortest_duration:
-                shortest_duration = total_duration
-                shortest = flight
-
     return best_overall, most_economical, shortest
+
+    # Extract relevant details for each flight
+    def extract_details(flight):
+        if not flight:
+            return None
+        
+        legs = flight.get('legs', [])
+        return {
+            'price': flight.get('price', {}).get('formatted'),
+            'score': flight.get('score'),
+            'origin': legs[0].get('origin', {}).get('city') if legs else None,
+            'destination': legs[-1].get('destination', {}).get('city') if legs else None,
+            'departure': legs[0].get('departure') if legs else None,
+            'arrival': legs[-1].get('arrival') if legs else None,
+            'duration': sum(leg.get('durationInMinutes', 0) for leg in legs),
+            'stops': sum(leg.get('stopCount', 0) for leg in legs),
+            'airline': legs[0].get('carriers', {}).get('marketing', [{}])[0].get('name') if legs else None
+        }
 
 
 model = genai.GenerativeModel('gemini-1.5-flash')
@@ -141,7 +153,8 @@ def generate_trip_plan(user_input):
     response = model.generate_content(f"""<|im_start|>system
 You are a helpful assistant that answers in JSON. Here's the json schema you must adhere to:\n<schema>\n{expected_schema}\n</schema><|im_end|>
 JUST GIVE THE JSON AS OUTPUT. ABSOLUTELY NOTHING ELSE. like nothing else. it should start with an opening curly brace and end with a closing curly brace
-if somethiung is not json seriasiable or null or something pick a random value lmao
+if somethiung is not json seriasiable or null or something pick a random value lmao. If the source location is not specified by the user assume it is Phoenix by default and also Autocorrect if there's any type, for example if someone types mombai you should be able to understand they meant mumbai.
+Also read the user input properly and see if the user's travel destination does not have the airport then get the nearest airport to the destination.
  {user_input}""")
     
     user_input = json.loads(response.text)
@@ -173,10 +186,11 @@ if somethiung is not json seriasiable or null or something pick a random value l
     print(best_overall)
     prompt = f"""
     Plan a trip based on the following information:
-    
     - Origin: {origin_query}
     - Destination: {destination_query}
-    
+    Make sure there is a section in the itinerary with flight section with 3 options displayed to the the user in case that Airline is the best option.
+    If the user wants to go to some place via driving or train or bus, make sure to include the best option for that as well.
+
     Best Overall Flight: {best_overall}
     
     Most Economical Flight: {most_economical}
